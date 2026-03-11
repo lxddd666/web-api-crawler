@@ -7,6 +7,11 @@ let currentPage = null;
 let crawlResults = [];
 let isRunning = false;
 
+// Interactive mode state
+let crawlMode = null;           // 'one-shot' | 'interactive'
+let navigationHistory = [];     // 导航历史
+let interactiveFilters = {};    // 交互式模式的过滤器
+
 // Helper to create page with stealth settings
 async function createStealthPage(context) {
   const page = await context.newPage();
@@ -204,4 +209,284 @@ function getRequests() {
   return crawlResults;
 }
 
-module.exports = { startCrawl, stopCrawl, getStatus, getRequests };
+// Interactive mode functions
+
+// Start interactive mode (browser stays open)
+async function startInteractive(url, options = {}) {
+  if (isRunning) {
+    throw new Error('Crawl already in progress');
+  }
+
+  const { cookies = [], headless = true, filters = {} } = options;
+
+  isRunning = true;
+  crawlResults = [];
+  navigationHistory = [];
+  interactiveFilters = filters;
+  crawlMode = 'interactive';
+
+  try {
+    // Launch browser
+    currentBrowser = await chromium.launch({
+      headless: headless,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--disable-web-security'
+      ]
+    });
+
+    // Create context
+    currentContext = await currentBrowser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      cookies: cookies,
+      viewport: { width: 1920, height: 1080 },
+      ignoreHTTPSErrors: true,
+      locale: 'en-US'
+    });
+
+    // Create page with stealth
+    currentPage = await createStealthPage(currentContext);
+
+    // Set up request tracking
+    setupRequestListeners(currentPage);
+
+    // Navigate to URL
+    await navigateToUrl(url);
+
+    return {
+      success: true,
+      mode: 'interactive',
+      currentUrl: url,
+      navigationHistory: navigationHistory,
+      totalRequests: crawlResults.length
+    };
+
+  } catch (error) {
+    await cleanup();
+    return { success: false, error: error.message };
+  }
+}
+
+// Set up request/response listeners
+function setupRequestListeners(page) {
+  const pendingRequests = new Map();
+
+  page.on('request', (request) => {
+    const requestUrl = request.url();
+
+    const requestData = {
+      id: uuidv4(),
+      url: requestUrl,
+      method: request.method(),
+      headers: request.headers(),
+      postData: request.postData() ? request.postData().toString() : null,
+      resourceType: request.resourceType(),
+      timestamp: Date.now(),
+      status: null,
+      responseBody: null,
+      responseHeaders: null
+    };
+
+    // Apply filters
+    if (interactiveFilters.domains && interactiveFilters.domains.length > 0) {
+      try {
+        const urlObj = new URL(requestUrl);
+        const matchesDomain = interactiveFilters.domains.some(domain =>
+          urlObj.hostname.includes(domain) || urlObj.hostname === domain
+        );
+        if (!matchesDomain) return;
+      } catch (e) {
+        return;
+      }
+    }
+
+    if (interactiveFilters.methods && interactiveFilters.methods.length > 0) {
+      if (!interactiveFilters.methods.includes(request.method())) return;
+    }
+
+    crawlResults.push(requestData);
+    pendingRequests.set(requestUrl, requestData);
+  });
+
+  page.on('response', async (response) => {
+    const responseUrl = response.url();
+    const req = pendingRequests.get(responseUrl);
+
+    if (req) {
+      req.status = response.status();
+      req.responseHeaders = response.headers();
+
+      try {
+        const body = await response.text();
+        req.responseBody = body;
+      } catch (e) {}
+
+      pendingRequests.delete(responseUrl);
+    }
+  });
+
+  page.on('requestfailed', (request) => {
+    const requestUrl = request.url();
+    const req = pendingRequests.get(requestUrl);
+
+    if (req) {
+      req.status = 0;
+      const failure = request.failure();
+      req.error = failure ? failure.errorText : 'Request failed';
+      pendingRequests.delete(requestUrl);
+    }
+  });
+}
+
+// Navigate to a new URL in interactive mode
+async function navigateToUrl(url) {
+  if (!currentPage) {
+    throw new Error('No active browser session');
+  }
+
+  try {
+    // Clear previous results when navigating to new URL
+    crawlResults = [];
+
+    try {
+      await currentPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      try {
+        await currentPage.goto(url, { waitUntil: 'load', timeout: 30000 });
+      } catch (e2) {}
+    }
+
+    await currentPage.waitForTimeout(2000);
+
+    // Add to navigation history
+    navigationHistory.push({
+      url: url,
+      timestamp: Date.now(),
+      title: await currentPage.title().catch(() => '')
+    });
+
+    return {
+      success: true,
+      currentUrl: url,
+      title: await currentPage.title().catch(() => ''),
+      totalRequests: crawlResults.length
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Get all clickable links from the current page
+async function getPageLinks() {
+  if (!currentPage) {
+    throw new Error('No active browser session');
+  }
+
+  try {
+    const links = await currentPage.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      return anchors.map(a => ({
+        href: a.href,
+        text: a.textContent.trim().substring(0, 100),
+        tagName: a.tagName
+      })).filter(l => l.href && l.href.startsWith('http'));
+    });
+
+    // Remove duplicates
+    const uniqueLinks = [];
+    const seen = new Set();
+    for (const link of links) {
+      if (!seen.has(link.href)) {
+        seen.add(link.href);
+        uniqueLinks.push(link);
+      }
+    }
+
+    return { success: true, links: uniqueLinks };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Click an element on the page
+async function clickElement(selector) {
+  if (!currentPage) {
+    throw new Error('No active browser session');
+  }
+
+  try {
+    await currentPage.click(selector);
+    await currentPage.waitForTimeout(2000);
+
+    return {
+      success: true,
+      currentUrl: currentPage.url(),
+      title: await currentPage.title().catch(() => ''),
+      totalRequests: crawlResults.length
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Close interactive mode
+async function closeInteractive() {
+  await cleanup();
+  crawlMode = null;
+  navigationHistory = [];
+  interactiveFilters = {};
+  return { success: true };
+}
+
+// Get interactive status
+function getInteractiveStatus() {
+  if (crawlMode !== 'interactive') {
+    return {
+      active: false,
+      mode: null,
+      currentUrl: null,
+      navigationHistory: [],
+      totalRequests: 0
+    };
+  }
+
+  return {
+    active: true,
+    mode: 'interactive',
+    currentUrl: currentPage ? currentPage.url() : null,
+    navigationHistory: navigationHistory,
+    totalRequests: crawlResults.length,
+    isBrowserOpen: !!currentBrowser
+  };
+}
+
+// Helper to cleanup resources
+async function cleanup() {
+  try {
+    if (currentPage) await currentPage.close();
+    if (currentContext) await currentContext.close();
+    if (currentBrowser) await currentBrowser.close();
+  } catch (e) {}
+
+  currentPage = null;
+  currentContext = null;
+  currentBrowser = null;
+  isRunning = false;
+}
+
+module.exports = {
+  startCrawl,
+  stopCrawl,
+  getStatus,
+  getRequests,
+  startInteractive,
+  navigateToUrl,
+  getPageLinks,
+  clickElement,
+  closeInteractive,
+  getInteractiveStatus
+};

@@ -28,6 +28,14 @@ export default function Crawler() {
   const [isResizing, setIsResizing] = useState(false)
   const resizeRef = useRef(null)
 
+  // Interactive mode state
+  const [crawlMode, setCrawlMode] = useState('one-shot')  // 'one-shot' | 'interactive'
+  const [interactiveStatus, setInteractiveStatus] = useState(null)
+  const [pageLinks, setPageLinks] = useState([])
+  const [navigationHistory, setNavigationHistory] = useState([])
+  const [isBrowserReady, setIsBrowserReady] = useState(false)
+  const [navigateUrl, setNavigateUrl] = useState('')
+
   // Selection state
   const [selectedIds, setSelectedIds] = useState([])
   const [showSaveModal, setShowSaveModal] = useState(false)
@@ -122,7 +130,12 @@ export default function Crawler() {
         methods: []
       }
 
-      const response = await fetch(`${API_BASE}/crawl/start`, {
+      // Choose endpoint based on crawl mode
+      const endpoint = crawlMode === 'interactive'
+        ? `${API_BASE}/crawl/interactive/start`
+        : `${API_BASE}/crawl/start`
+
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -140,7 +153,22 @@ export default function Crawler() {
       const data = await response.json()
 
       if (data.success) {
-        setRequests(data.requests)
+        if (crawlMode === 'interactive') {
+          // Interactive mode - keep browser open
+          setIsBrowserReady(true)
+          setInteractiveStatus({
+            currentUrl: data.currentUrl,
+            navigationHistory: data.navigationHistory || [],
+            isRunning: true
+          })
+          setNavigationHistory(data.navigationHistory || [])
+          // Fetch page links
+          fetchPageLinks()
+          // Poll for status and requests
+          startInteractivePolling()
+        } else {
+          setRequests(data.requests)
+        }
       } else {
         setError(data.error || 'Crawl failed')
       }
@@ -148,6 +176,108 @@ export default function Crawler() {
       setError(err.message)
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  // Poll for interactive status and requests
+  const startInteractivePolling = () => {
+    const pollInterval = setInterval(async () => {
+      try {
+        const [statusRes, requestsRes] = await Promise.all([
+          fetch(`${API_BASE}/crawl/interactive/status`),
+          fetch(`${API_BASE}/crawl/requests`)
+        ])
+
+        const statusData = await statusRes.json()
+        const requestsData = await requestsRes.json()
+
+        if (statusData.active) {
+          setInteractiveStatus(statusData)
+          setNavigationHistory(statusData.navigationHistory || [])
+          setRequests(requestsData.requests || [])
+        } else {
+          // Browser closed
+          clearInterval(pollInterval)
+          setIsBrowserReady(false)
+        }
+      } catch (e) {
+        console.error('Polling error:', e)
+      }
+    }, 2000)
+
+    return () => clearInterval(pollInterval)
+  }
+
+  // Fetch page links
+  const fetchPageLinks = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/crawl/interactive/links`)
+      const data = await response.json()
+      if (data.success) {
+        setPageLinks(data.links || [])
+      }
+    } catch (e) {
+      console.error('Error fetching links:', e)
+    }
+  }
+
+  // Navigate to URL in interactive mode
+  const handleNavigate = async () => {
+    if (!navigateUrl) return
+
+    setIsLoading(true)
+    try {
+      const response = await fetch(`${API_BASE}/crawl/interactive/navigate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: navigateUrl })
+      })
+      const data = await response.json()
+      if (data.success) {
+        setNavigateUrl('')
+        fetchPageLinks()
+      } else {
+        setError(data.error)
+      }
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Click link handler
+  const handleLinkClick = async (href) => {
+    setIsLoading(true)
+    try {
+      const response = await fetch(`${API_BASE}/crawl/interactive/navigate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: href })
+      })
+      const data = await response.json()
+      if (data.success) {
+        fetchPageLinks()
+      } else {
+        setError(data.error)
+      }
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Close interactive browser
+  const handleCloseInteractive = async () => {
+    try {
+      await fetch(`${API_BASE}/crawl/interactive/close`, { method: 'POST' })
+      setIsBrowserReady(false)
+      setInteractiveStatus(null)
+      setPageLinks([])
+      setNavigationHistory([])
+    } catch (err) {
+      console.error('Error closing browser:', err)
     }
   }
 
@@ -323,9 +453,23 @@ export default function Crawler() {
         </div>
 
         <div className="flex flex-wrap items-center gap-4">
+          {/* Crawl Mode Selection */}
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-slate-400">Crawl:</label>
+            <select
+              value={crawlMode}
+              onChange={(e) => setCrawlMode(e.target.value)}
+              className="bg-slate-700 border border-slate-600 rounded-md px-3 py-1.5 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
+              disabled={isLoading || isBrowserReady}
+            >
+              <option value="one-shot">One-Shot</option>
+              <option value="interactive">Interactive</option>
+            </select>
+          </div>
+
           {/* Mode Selection */}
           <div className="flex items-center gap-2">
-            <label className="text-sm text-slate-400">Mode:</label>
+            <label className="text-sm text-slate-400">Auth:</label>
             <select
               value={mode}
               onChange={(e) => setMode(e.target.value)}
@@ -465,6 +609,100 @@ export default function Crawler() {
           )}
         </div>
       </div>
+
+      {/* Interactive Mode Panel */}
+      {crawlMode === 'interactive' && (
+        <div className="bg-slate-800 border-b border-slate-700">
+          {/* Browser Status & Navigation */}
+          <div className="p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-3">
+                <div className={`w-3 h-3 rounded-full ${isBrowserReady ? 'bg-green-500 animate-pulse' : 'bg-slate-500'}`}></div>
+                <span className="text-sm font-medium text-slate-200">
+                  {isBrowserReady ? 'Browser Running' : 'Browser Closed'}
+                </span>
+                {interactiveStatus?.currentUrl && (
+                  <span className="text-xs text-slate-400 ml-2">
+                    {interactiveStatus.currentUrl.substring(0, 60)}...
+                  </span>
+                )}
+              </div>
+              {isBrowserReady && (
+                <button
+                  onClick={handleCloseInteractive}
+                  className="bg-red-600 hover:bg-red-500 text-white px-4 py-1.5 rounded-md text-sm font-medium transition-colors"
+                >
+                  Close Browser
+                </button>
+              )}
+            </div>
+
+            {/* Navigation Input */}
+            {isBrowserReady && (
+              <div className="flex gap-2 mb-3">
+                <input
+                  type="text"
+                  value={navigateUrl}
+                  onChange={(e) => setNavigateUrl(e.target.value)}
+                  placeholder="Enter URL to navigate..."
+                  className="flex-1 bg-slate-700 border border-slate-600 rounded-md px-4 py-2 text-slate-200 placeholder-slate-400 focus:outline-none focus:border-blue-500 text-sm"
+                  onKeyDown={(e) => e.key === 'Enter' && handleNavigate()}
+                />
+                <button
+                  onClick={handleNavigate}
+                  disabled={!navigateUrl || isLoading}
+                  className="bg-blue-600 hover:bg-blue-500 disabled:bg-slate-600 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors"
+                >
+                  Navigate
+                </button>
+              </div>
+            )}
+
+            {/* Navigation History */}
+            {navigationHistory.length > 0 && (
+              <div className="mb-3">
+                <div className="text-xs text-slate-400 mb-1">Navigation History:</div>
+                <div className="flex flex-wrap gap-2">
+                  {navigationHistory.slice(-5).map((item, idx) => (
+                    <button
+                      key={idx}
+                      onClick={() => handleLinkClick(item.url)}
+                      className="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1 rounded truncate max-w-[200px]"
+                      title={item.url}
+                    >
+                      {item.url.replace(/^https?:\/\//, '').substring(0, 30)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Page Links */}
+            {isBrowserReady && pageLinks.length > 0 && (
+              <div>
+                <div className="text-xs text-slate-400 mb-1">Page Links ({pageLinks.length}):</div>
+                <div className="max-h-32 overflow-y-auto bg-slate-900 rounded-md p-2">
+                  <div className="flex flex-wrap gap-1">
+                    {pageLinks.slice(0, 50).map((link, idx) => (
+                      <button
+                        key={idx}
+                        onClick={() => handleLinkClick(link.href)}
+                        className="text-xs bg-blue-900/50 hover:bg-blue-800 text-blue-300 px-2 py-1 rounded truncate max-w-[200px]"
+                        title={link.href}
+                      >
+                        {link.text || link.href.replace(/^https?:\/\//, '').substring(0, 25)}
+                      </button>
+                    ))}
+                    {pageLinks.length > 50 && (
+                      <span className="text-xs text-slate-500">...and {pageLinks.length - 50} more</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Main Content */}
       <div className="flex-1 flex overflow-hidden">
