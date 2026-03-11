@@ -20,7 +20,7 @@ const getStatusClass = (status) => {
   return 'text-slate-500'
 }
 
-export default function RequestList({ requests, filter, onSelect, selectedId }) {
+export default function RequestList({ requests, filter, onSelect, selectedId, selectedIds, onToggleSelect }) {
   const filteredRequests = useMemo(() => {
     return requests.filter(req => {
       // Method filter
@@ -44,6 +44,17 @@ export default function RequestList({ requests, filter, onSelect, selectedId }) 
     }
   }
 
+  const handleRowClick = (e, req) => {
+    // Don't toggle if clicking on checkbox
+    if (e.target.type === 'checkbox') return
+    onSelect(req)
+  }
+
+  const handleCheckboxChange = (e, reqId) => {
+    e.stopPropagation()
+    onToggleSelect(reqId)
+  }
+
   if (filteredRequests.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-slate-500">
@@ -61,6 +72,16 @@ export default function RequestList({ requests, filter, onSelect, selectedId }) 
       <table className="w-full">
         <thead className="bg-slate-800 sticky top-0">
           <tr>
+            <th className="text-left p-3 text-slate-400 text-sm font-medium w-12">
+              {selectedIds && onToggleSelect && (
+                <input
+                  type="checkbox"
+                  className="w-4 h-4"
+                  checked={filteredRequests.length > 0 && filteredRequests.every(r => selectedIds.includes(r.id))}
+                  onChange={() => {}}
+                />
+              )}
+            </th>
             <th className="text-left p-3 text-slate-400 text-sm font-medium w-24">Method</th>
             <th className="text-left p-3 text-slate-400 text-sm font-medium w-20">Status</th>
             <th className="text-left p-3 text-slate-400 text-sm font-medium">URL</th>
@@ -71,13 +92,24 @@ export default function RequestList({ requests, filter, onSelect, selectedId }) 
           {filteredRequests.map((req) => (
             <tr
               key={req.id}
-              onClick={() => onSelect(req)}
+              onClick={(e) => handleRowClick(e, req)}
               className={`border-b border-slate-800 cursor-pointer transition-colors ${
                 selectedId === req.id
                   ? 'bg-blue-900/30'
                   : 'hover:bg-slate-800/50'
               }`}
             >
+              <td className="p-3">
+                {selectedIds && onToggleSelect && (
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.includes(req.id)}
+                    onChange={(e) => handleCheckboxChange(e, req.id)}
+                    className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-blue-600"
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                )}
+              </td>
               <td className="p-3">
                 <span className={`${getMethodClass(req.method)} text-white text-xs font-bold px-2 py-1 rounded`}>
                   {req.method}

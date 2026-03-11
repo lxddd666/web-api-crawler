@@ -3,6 +3,9 @@ import RequestList from '../components/RequestList'
 import RequestFilter from '../components/RequestFilter'
 import RequestDetail from '../components/RequestDetail'
 import ExportButton from '../components/ExportButton'
+import RequestSelector, { RequestCheckbox } from '../components/RequestSelector'
+
+const CRAWLER_STORAGE_KEY = 'crawlerState'
 
 const API_BASE = '/api'
 
@@ -24,6 +27,13 @@ export default function Crawler() {
   const [detailWidth, setDetailWidth] = useState(384)
   const [isResizing, setIsResizing] = useState(false)
   const resizeRef = useRef(null)
+
+  // Selection state
+  const [selectedIds, setSelectedIds] = useState([])
+  const [showSaveModal, setShowSaveModal] = useState(false)
+  const [moduleName, setModuleName] = useState('')
+  const [moduleDescription, setModuleDescription] = useState('')
+  const [saving, setSaving] = useState(false)
 
   // Handle resize drag
   useEffect(() => {
@@ -51,6 +61,38 @@ export default function Crawler() {
       document.body.style.userSelect = ''
     }
   }, [isResizing])
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(CRAWLER_STORAGE_KEY)
+      if (saved) {
+        const { requests: savedRequests, selectedIds: savedSelectedIds } = JSON.parse(saved)
+        if (savedRequests && Array.isArray(savedRequests) && savedRequests.length > 0) {
+          setRequests(savedRequests)
+        }
+        if (savedSelectedIds && Array.isArray(savedSelectedIds)) {
+          setSelectedIds(savedSelectedIds)
+        }
+      }
+    } catch (e) {
+      console.error('Error loading crawler state:', e)
+    }
+  }, [])
+
+  // Save to localStorage when requests or selectedIds change
+  useEffect(() => {
+    if (requests.length > 0) {
+      try {
+        localStorage.setItem(CRAWLER_STORAGE_KEY, JSON.stringify({
+          requests,
+          selectedIds
+        }))
+      } catch (e) {
+        console.error('Error saving crawler state:', e)
+      }
+    }
+  }, [requests, selectedIds])
 
   const handleStartCrawl = async () => {
     if (!url) {
@@ -122,6 +164,122 @@ export default function Crawler() {
     setRequests([])
     setSelectedRequest(null)
     setError(null)
+    setSelectedIds([])
+  }
+
+  const handleSelectionChange = (ids) => {
+    setSelectedIds(ids)
+  }
+
+  const handleSaveToModule = async () => {
+    if (!moduleName.trim()) {
+      return
+    }
+
+    setSaving(true)
+    setError(null)
+    try {
+      // First, create the module
+      const createResponse = await fetch(`${API_BASE}/modules`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: moduleName,
+          description: moduleDescription
+        })
+      })
+
+      const createData = await createResponse.json()
+
+      if (!createData.success) {
+        if (createData.error.includes('already exists')) {
+          // Module exists, get its ID
+          const listResponse = await fetch(`${API_BASE}/modules`)
+          const listData = await listResponse.json()
+          const existingModule = listData.modules.find(m => m.name === moduleName)
+          if (existingModule) {
+            await addRequestsToModule(existingModule.id)
+            handleSaveSuccess()
+            return
+          }
+        }
+        throw new Error(createData.error)
+      }
+
+      // Add requests to the new module
+      await addRequestsToModule(createData.module.id)
+      handleSaveSuccess()
+
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleSaveSuccess = () => {
+    setShowSaveModal(false)
+    setModuleName('')
+    setModuleDescription('')
+  }
+
+  const addRequestsToModule = async (moduleId) => {
+    // Extract GET parameters from URL and save as JSON
+    const extractGetParams = (url) => {
+      try {
+        const urlObj = new URL(url)
+        const params = {}
+        urlObj.searchParams.forEach((value, key) => {
+          params[key] = value
+        })
+        return Object.keys(params).length > 0 ? JSON.stringify(params) : null
+      } catch {
+        return null
+      }
+    }
+
+    // Keep all essential fields including responseBody
+    const selectedRequests = requests
+      .filter(r => selectedIds.includes(r.id))
+      .map(r => ({
+        url: r.url,
+        method: r.method,
+        headers: r.headers,
+        postData: r.method === 'GET' ? extractGetParams(r.url) : r.postData,
+        resourceType: r.resourceType,
+        timestamp: r.timestamp,
+        status: r.status,
+        responseBody: r.responseBody,
+        responseHeaders: r.responseHeaders,
+        error: r.error
+      }))
+
+    const response = await fetch(`${API_BASE}/modules/addRequests?id=${moduleId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests: selectedRequests })
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      try {
+        const errorData = JSON.parse(errorText)
+        throw new Error(errorData.error || `HTTP ${response.status}`)
+      } catch (e) {
+        if (e instanceof SyntaxError) {
+          throw new Error(`HTTP ${response.status}: ${errorText.substring(0, 100)}`)
+        }
+        throw e
+      }
+    }
+
+    const data = await response.json()
+    if (data.success) {
+      alert(`Successfully saved ${selectedRequests.length} requests to module "${moduleName}"`)
+      setSelectedIds([])
+    } else {
+      throw new Error(data.error)
+    }
   }
 
   const stats = {
@@ -136,22 +294,6 @@ export default function Crawler() {
 
   return (
     <div className="h-screen flex flex-col">
-      {/* Header */}
-      <header className="bg-slate-800 border-b border-slate-700 p-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="text-2xl">🕷️</div>
-            <div>
-              <h1 className="text-xl font-bold text-slate-100">API Crawler</h1>
-              <p className="text-sm text-slate-400">Capture and analyze HTTP requests</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <ExportButton requests={requests} />
-          </div>
-        </div>
-      </header>
-
       {/* URL Input Section */}
       <div className="bg-slate-800/50 border-b border-slate-700 p-4">
         <div className="flex gap-3 mb-3">
@@ -275,6 +417,21 @@ export default function Crawler() {
             <span className="text-sm">Crawling in progress... (waiting {waitTime}s for requests)</span>
           </div>
         )}
+
+        {/* Action Toolbar */}
+        <div className="mt-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            {selectedIds.length > 0 && (
+              <button
+                onClick={() => setShowSaveModal(true)}
+                className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-md font-medium transition-colors"
+              >
+                💾 Save ({selectedIds.length})
+              </button>
+            )}
+          </div>
+          <ExportButton requests={requests} />
+        </div>
       </div>
 
       {/* Stats Bar */}
@@ -318,11 +475,24 @@ export default function Crawler() {
             filter={filter}
             setFilter={setFilter}
           />
+          <RequestSelector
+            requests={requests}
+            selectedIds={selectedIds}
+            onSelectionChange={handleSelectionChange}
+          />
           <RequestList
             requests={requests}
             filter={filter}
             onSelect={setSelectedRequest}
             selectedId={selectedRequest?.id}
+            selectedIds={selectedIds}
+            onToggleSelect={(id) => {
+              if (selectedIds.includes(id)) {
+                setSelectedIds(selectedIds.filter(i => i !== id))
+              } else {
+                setSelectedIds([...selectedIds, id])
+              }
+            }}
           />
         </div>
 
@@ -343,6 +513,62 @@ export default function Crawler() {
           />
         </div>
       </div>
+
+      {/* Save to Module Modal */}
+      {showSaveModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-slate-800 rounded-lg border border-slate-700 w-full max-w-md">
+            <div className="flex items-center justify-between p-4 border-b border-slate-700">
+              <h2 className="text-lg font-semibold text-slate-200">💾 Save to Module</h2>
+              <button
+                onClick={() => setShowSaveModal(false)}
+                className="text-slate-400 hover:text-slate-200 text-xl"
+              >
+                ×
+              </button>
+            </div>
+            <div className="p-4">
+              <div className="mb-4">
+                <label className="block text-sm text-slate-400 mb-1">Module Name *</label>
+                <input
+                  type="text"
+                  value={moduleName}
+                  onChange={(e) => setModuleName(e.target.value)}
+                  placeholder="e.g., Finance API"
+                  className="w-full bg-slate-700 border border-slate-600 rounded-md px-4 py-2 text-slate-200 placeholder-slate-400 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+              <div className="mb-4">
+                <label className="block text-sm text-slate-400 mb-1">Description</label>
+                <textarea
+                  value={moduleDescription}
+                  onChange={(e) => setModuleDescription(e.target.value)}
+                  placeholder="Optional description..."
+                  className="w-full bg-slate-700 border border-slate-600 rounded-md px-4 py-2 text-slate-200 placeholder-slate-400 focus:outline-none focus:border-blue-500 resize-none h-20"
+                />
+              </div>
+              <div className="text-sm text-slate-400">
+                Will save {selectedIds.length} selected requests
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-3 p-4 border-t border-slate-700">
+              <button
+                onClick={() => setShowSaveModal(false)}
+                className="bg-slate-700 hover:bg-slate-600 text-slate-200 px-4 py-2 rounded-md font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveToModule}
+                disabled={!moduleName.trim() || saving}
+                className="bg-green-600 hover:bg-green-500 disabled:bg-slate-600 disabled:text-slate-400 text-white px-6 py-2 rounded-md font-medium transition-colors"
+              >
+                {saving ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
